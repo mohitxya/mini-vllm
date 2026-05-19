@@ -42,11 +42,11 @@ class HFBackend(Backend):
 
     def generate_one(self, prompt: str, max_new_tokens: int = 30) -> str:
        
-        return self.generate_one_manual_greedy(
+        return self.generate_one_with_kv_cache(
             prompt=prompt, 
             max_new_tokens = max_new_tokens,
         )
-    def generate_one_manual_greedy(
+    def generate_one_without_kv_cache(
         self, 
         prompt: str,
         max_new_tokens: int=30, 
@@ -100,3 +100,66 @@ class HFBackend(Backend):
         )
 
         return generated_text
+
+    def generate_one_with_kv_cache(self, prompt: str, max_new_tokens: int=30,) -> str: 
+        """
+            Manual greedy decoding with KV Cache. 
+            Key idea: 
+                - First forward pass processes the full prompt. 
+                - The model returns past_key_values. 
+                - Later forward passes only process the newly generated token. 
+                - Old attention keys/values are reused from cache. 
+
+            This avoids recomputing the whole prefix every step. 
+        """
+        encoded = self.tokenizer(prompt, return_tensors="pt")
+        input_ids = encoded["input_ids"].to(self.device)
+
+        # We keep generated token IDs separately so decoding is easy. 
+        generated_ids = input_ids
+
+        past_key_values = None
+        
+        with torch.no_grad(): 
+            for step in range(max_new_tokens):
+
+                if step == 0: 
+                    # feed full prompt
+                    model_input_ids = input_ids
+                else: 
+                    # feed only the most recently generated token. 
+                    model_input_ids = next_token_id
+                outputs = self.model(
+                    input_ids = model_input_ids, 
+                    past_key_values=past_key_values, 
+                    use_cache=True,
+                )
+                logits = outputs.logits
+
+                # store cache for next step. 
+                past_key_values = outputs.past_key_values
+
+                next_token_logits = logits[:,-1,:]
+
+                next_token_id = torch.argmax(
+                    next_token_logits,
+                    dim=-1,
+                    keepdim=True,
+                )
+
+                if next_token_id.item() == self.tokenizer.eos_token_id:
+                    break
+                
+                generated_ids = torch.cat([generated_ids, next_token_id],
+                                          dim=1,)
+            return self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    
+    def generate_one_with_kv_cache_debug(
+        self, 
+        prompt: str, 
+        max_new_tokens: int=5,
+    ) -> str: 
+        """
+            debug version that prints shapes of: input ids, logits, past key values. 
+            to understand internals of KV Cache. 
+        """
