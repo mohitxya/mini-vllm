@@ -231,23 +231,41 @@ class HFBackend(Backend):
 
     def _print_kv_cache_shapes(self, past_key_values) -> None: 
         """
-            Print shape information for hugging face past_key_values
+        Print shape information for Hugging Face KV cache.
 
-            for gpt 2 style models it's a tuple usually
+        Transformers may return cache in two formats:
 
-            length: number of transformer layers. 
-            each layer contains: key tensor, value tensor
-        """    
+        1. Older legacy tuple format:
+            past_key_values[layer_idx] = (key_tensor, value_tensor)
+
+        2. Newer DynamicCache format:
+            past_key_values.key_cache[layer_idx]
+            past_key_values.value_cache[layer_idx]
+
+        This function supports both.
+        """
+
         print("\nKV Cache:")
-        print("number of layers cached:", len(past_key_values))
+        print("cache object type:", type(past_key_values))
 
-        first_layer = past_key_values[0]
+        # New Transformers cache format: DynamicCache
+        if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
+            key_cache = past_key_values.key_cache
+            value_cache = past_key_values.value_cache
 
-        key_tensor = first_layer[0]
-        value_tensor = first_layer[1]
+            print("cache format: DynamicCache")
+            print("number of layers cached:", len(key_cache))
 
-        print("first layer key shape: ", tuple(key_tensor.shape))
-        print("first layer value shape: ", tuple(value_tensor.shape))
+            first_key = key_cache[0]
+            first_value = value_cache[0]
+
+            print("first layer key shape:  ", tuple(first_key.shape))
+            print("first layer value shape:", tuple(first_value.shape))
+
+            if hasattr(past_key_values, "get_seq_length"):
+                print("cached sequence length:", past_key_values.get_seq_length())
+
+            return
 
     def compare_kv_cache_speed(
         self, 
