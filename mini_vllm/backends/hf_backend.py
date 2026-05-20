@@ -1,32 +1,42 @@
+from __future__ import annotations
+
+import time
+
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from mini_vllm.backends.base import Backend
+from mini_vllm.runtime.request import GenerationRequest
 
 
 class HFBackend(Backend):
     """
-        Milestone 1: model.generate(), which hides the decoding loop. 
-        Milestone 2: We manually implement autoregressive decoding.
-        Milestone 3: manual greedy decoding with KV Cache. 
-        Important: 
-            We still use Hugging Face for: 
-            - loading model weights. 
-            - loading tokenizer.
-            - running the transformer forward pass. 
+    Hugging Face backend.
 
-            But we now control: 
-            - the token-by-token loop. 
-            - how next token is selected. 
-            - when generation stops
+    This backend uses:
+        - Hugging Face tokenizer
+        - Hugging Face model weights
+        - PyTorch execution
+        - Hugging Face KV cache support
+
+    But our runtime controls generation.
+
+    Milestone 5 adds:
+        - prefill(request)
+        - decode_one(request)
+
+    This is the core API needed for future scheduling.
     """
-    def __init__(
-            self, 
-            model_name: str = "sshleifer/tiny-gpt2", 
-            device: str | None = None):
 
+    def __init__(
+        self,
+        model_name: str = "distilgpt2",
+        device: str | None = None,
+        stop_after_repeated_whitespace: int = 3,
+    ):
         self.model_name = model_name
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.stop_after_repeated_whitespace = stop_after_repeated_whitespace
 
         print(f"Loading model: {model_name}")
         print(f"Using device: {self.device}")
@@ -35,277 +45,380 @@ class HFBackend(Backend):
         self.model = AutoModelForCausalLM.from_pretrained(model_name)
 
         self.model.to(self.device)
-        self.model.eval() # disables dropout, BatchNorm behaves differently. 
+        self.model.eval()
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+    # ------------------------------------------------------------------
+    # Backward-compatible full generation API
+    # ------------------------------------------------------------------
+
     def generate_one(self, prompt: str, max_new_tokens: int = 30) -> str:
-       
-        return self.generate_one_with_kv_cache(
-            prompt=prompt, 
-            max_new_tokens = max_new_tokens,
-        )
-    def generate_one_without_kv_cache(
-        self, 
-        prompt: str,
-        max_new_tokens: int=30, 
-    ) -> str: 
         """
-            Manually generate text token by token using greedy decoding.
+        Generate one full response.
 
-            Greedy decoding means: 
-                At every step, choose the token with the highest probability. 
-            This is deterministic. 
-            same prompt -> same output
+        This now uses the step API internally:
+
+            request
+            prefill(request)
+            while not finished:
+                decode_one(request)
+
+        This proves that the step API can reproduce full generation.
         """
-        # step 1: prompt text to token IDs. 
-        encoded = self.tokenizer(
-            prompt, 
-            return_tensors = "pt",
+
+        request = GenerationRequest(
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
         )
 
-        input_ids = encoded["input_ids"].to(self.device)
+        self.prefill(request)
 
-        # input_ids shape: [batch_size, sequence_length]
-        # batch_size = 1 for single prompt. 
+        while not request.is_finished():
+            self.decode_one(request)
 
-        # step 2: generate one token at a time.
-        with torch.no_grad():
-            for step in range(max_new_tokens):
-                # transformer forward pass. 
-                outputs = self.model(input_ids=input_ids)
+        if request.status.value == "FAILED":
+            raise RuntimeError(request.error)
 
-                # for every position in the sequence, 
-                # the model predicts scores for every token in vocabulary.
-                logits = outputs.logits
+        return request.generated_text or ""
 
-                next_token_logits = logits[:,-1,:]
+    # ------------------------------------------------------------------
+    # Milestone 5: prefill/decode API
+    # ------------------------------------------------------------------
 
-                # shape: [batch_size, vocab_size]
-                # for us: [1,50257]
+    def prefill(self, request: GenerationRequest) -> None:
+        """
+        Process the full prompt and generate the first token.
 
-                next_token_id = torch.argmax(
-                    next_token_logits, 
-                    dim = 1,
-                    keepdim = True, 
+        This is the "prefill" phase.
+
+        Important:
+            Prefill is usually more expensive than a single decode step
+            because it processes the entire prompt.
+
+        This method updates the request in-place.
+        """
+
+        if request.is_finished():
+            return
+
+        request.mark_running()
+
+        try:
+            encoded = self.tokenizer(
+                request.prompt,
+                return_tensors="pt",
+            )
+
+            input_ids = encoded["input_ids"].to(self.device)
+
+            request.input_ids = input_ids
+            request.generated_ids = input_ids
+
+            with torch.no_grad():
+                outputs = self.model(
+                    input_ids=input_ids,
+                    use_cache=True,
                 )
-                if next_token_id.item() == self.tokenizer.eos_token_id:
-                    break
 
-                input_ids = torch.cat([input_ids, next_token_id], dim=1)
+                request.past_key_values = outputs.past_key_values
+
+                logits = outputs.logits
+                next_token_logits = logits[:, -1, :]
+
+                next_token_id = self._select_next_token_greedy(
+                    next_token_logits
+                )
+
+            request.has_prefilled = True
+
+            self._append_or_finish(
+                request=request,
+                next_token_id=next_token_id,
+            )
+
+        except Exception as exc:
+            request.mark_failed(exc)
+
+    def decode_one(self, request: GenerationRequest) -> None:
+        """
+        Generate exactly one token after prefill.
+
+        This is the "decode" phase.
+
+        Instead of passing the full sequence again, we pass only:
+
+            request.last_token_id
+
+        plus:
+
+            request.past_key_values
+
+        This is what makes KV-cache decoding efficient.
+        """
+
+        if request.is_finished():
+            return
+
+        if not request.has_prefilled:
+            raise RuntimeError(
+                "Cannot decode before prefill. "
+                "Call backend.prefill(request) first."
+            )
+
+        if request.last_token_id is None:
+            # This can happen if prefill generated EOS immediately.
+            return
+
+        try:
+            with torch.no_grad():
+                outputs = self.model(
+                    input_ids=request.last_token_id,
+                    past_key_values=request.past_key_values,
+                    use_cache=True,
+                )
+
+                request.past_key_values = outputs.past_key_values
+
+                logits = outputs.logits
+                next_token_logits = logits[:, -1, :]
+
+                next_token_id = self._select_next_token_greedy(
+                    next_token_logits
+                )
+
+            self._append_or_finish(
+                request=request,
+                next_token_id=next_token_id,
+            )
+
+        except Exception as exc:
+            request.mark_failed(exc)
+
+    # ------------------------------------------------------------------
+    # Token selection
+    # ------------------------------------------------------------------
+
+    def _select_next_token_greedy(self, next_token_logits: torch.Tensor) -> torch.Tensor:
+        """
+        Greedy decoding.
+
+        next_token_logits shape:
+            [batch_size, vocab_size]
+
+        Returns:
+            next_token_id shape [batch_size, 1]
+
+        Greedy means:
+            choose token with highest logit.
+        """
+
+        return torch.argmax(
+            next_token_logits,
+            dim=-1,
+            keepdim=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Request update helpers
+    # ------------------------------------------------------------------
+
+    def _append_or_finish(
+        self,
+        request: GenerationRequest,
+        next_token_id: torch.Tensor,
+    ) -> None:
+        """
+        Decide whether to append the token or finish the request.
+
+        Stop conditions:
+            1. EOS token generated
+            2. max_new_tokens reached
+            3. too many repeated whitespace tokens
+        """
+
+        if next_token_id.item() == self.tokenizer.eos_token_id:
+            self._finish_request(request)
+            return
+
+        token_text = self.tokenizer.decode(next_token_id[0])
+
+        # Track whitespace repetition to avoid ugly blank-line loops.
+        if not hasattr(request, "consecutive_whitespace_tokens"):
+            request.consecutive_whitespace_tokens = 0
+
+        if token_text.strip() == "":
+            request.consecutive_whitespace_tokens += 1
+        else:
+            request.consecutive_whitespace_tokens = 0
+
+        if request.consecutive_whitespace_tokens >= self.stop_after_repeated_whitespace:
+            self._finish_request(request)
+            return
+
+        request.generated_ids = torch.cat(
+            [request.generated_ids, next_token_id],
+            dim=1,
+        )
+
+        request.last_token_id = next_token_id
+        request.num_generated_tokens += 1
+
+        if request.num_generated_tokens >= request.max_new_tokens:
+            self._finish_request(request)
+
+    def _finish_request(self, request: GenerationRequest) -> None:
+        """
+        Decode generated token IDs and mark request as finished.
+        """
+
+        if request.generated_ids is None:
+            request.mark_finished("")
+            return
+
         generated_text = self.tokenizer.decode(
-            input_ids[0], 
+            request.generated_ids[0],
             skip_special_tokens=True,
         )
 
-        return generated_text
+        request.mark_finished(generated_text)
 
-    def generate_one_with_kv_cache(self, prompt: str, max_new_tokens: int=30,) -> str: 
+    # ------------------------------------------------------------------
+    # Debug helpers
+    # ------------------------------------------------------------------
+
+    def print_request_state(self, request: GenerationRequest) -> None:
         """
-            Manual greedy decoding with KV Cache. 
-            Key idea: 
-                - First forward pass processes the full prompt. 
-                - The model returns past_key_values. 
-                - Later forward passes only process the newly generated token. 
-                - Old attention keys/values are reused from cache. 
-
-            This avoids recomputing the whole prefix every step. 
+        Print useful debugging information about a request.
         """
-        encoded = self.tokenizer(prompt, return_tensors="pt")
-        input_ids = encoded["input_ids"].to(self.device)
 
-        # We keep generated token IDs separately so decoding is easy. 
-        generated_ids = input_ids
+        print(f"\nRequest {request.short_id()}")
+        print(f"status: {request.status}")
+        print(f"has_prefilled: {request.has_prefilled}")
+        print(f"num_generated_tokens: {request.num_generated_tokens}")
 
-        past_key_values = None
-        
-        with torch.no_grad(): 
-            for step in range(max_new_tokens):
+        if request.input_ids is not None:
+            print(f"input_ids shape: {tuple(request.input_ids.shape)}")
 
-                if step == 0: 
-                    # feed full prompt
-                    model_input_ids = input_ids
-                else: 
-                    # feed only the most recently generated token. 
-                    model_input_ids = next_token_id
-                outputs = self.model(
-                    input_ids = model_input_ids, 
-                    past_key_values=past_key_values, 
-                    use_cache=True,
-                )
-                logits = outputs.logits
+        if request.generated_ids is not None:
+            print(f"generated_ids shape: {tuple(request.generated_ids.shape)}")
 
-                # store cache for next step. 
-                past_key_values = outputs.past_key_values
+        if request.last_token_id is not None:
+            print(f"last_token_id: {request.last_token_id.item()}")
+            print(
+                "last_token_text:",
+                repr(self.tokenizer.decode(request.last_token_id[0])),
+            )
 
-                next_token_logits = logits[:,-1,:]
+        if request.past_key_values is not None:
+            self._print_kv_cache_shapes(request.past_key_values)
 
-                next_token_id = torch.argmax(
-                    next_token_logits,
-                    dim=-1,
-                    keepdim=True,
-                )
-
-                if next_token_id.item() == self.tokenizer.eos_token_id:
-                    break
-                
-                generated_ids = torch.cat([generated_ids, next_token_id],
-                                          dim=1,)
-            return self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-    
-    def generate_one_with_kv_cache_debug(
-        self, 
-        prompt: str, 
-        max_new_tokens: int=5,
-    ) -> str: 
-        """
-            debug version that prints shapes of: input ids, logits, past key values. 
-            to understand internals of KV Cache. 
-        """
-        encoded = self.tokenizer(prompt, return_tensors="pt")
-        input_ids = encoded["input_ids"].to(self.device)
-
-        generated_ids = input_ids
-        past_key_values = None
-
-        print("\n=== Initial Prompt ===")
-        print(prompt)
-
-        print("\n=== Initial input_ids ===")
-        print(input_ids)
-        print("input_ids shape:", tuple(input_ids.shape))
-        
-        with torch.no_grad(): 
-            for step in range(max_new_tokens):
-                print(f"\n========= Step {step + 1} =========")
-
-                if step == 0: 
-                    model_input_ids = input_ids
-                    print("Feeding FULL prompt")
-                else: 
-                    model_input_ids = next_token_id
-                    print("Feeding ONLY last generated token")
-                
-                print("model_input_ids:", model_input_ids)
-                print("model_input_ids shape:", tuple(model_input_ids.shape))
-
-                outputs = self.model(
-                    input_ids = model_input_ids, 
-                    past_key_values = past_key_values, 
-                    use_cache = True,
-                )
-
-                logits = outputs.logits
-                past_key_values = outputs.past_key_values
-
-                print("logits shape:", tuple(logits.shape))
-
-                self._print_kv_cache_shapes(past_key_values)
-
-                next_token_logits = logits[:, -1, :]
-
-                next_token_id = torch.argmax(
-                    next_token_logits, 
-                    dim = -1, 
-                    keepdim=True, 
-                )
-
-                token_text = self.tokenizer.decode(next_token_id[0])
-
-                print("next_token_id:", next_token_id.item())
-                print("next_token_text:", repr(token_text))
-
-                if next_token_id.item() == self.tokenizer.eos_token_id: 
-                    print("EOS token generated. Stopping.")
-                    break
-
-                generated_ids = torch.cat(
-                    [generated_ids, next_token_id], 
-                    dim = 1,
-                )
-
-                print("generated_ids shape:", tuple(generated_ids.shape))
-
-            return self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-
-    def _print_kv_cache_shapes(self, past_key_values) -> None: 
+    def _print_kv_cache_shapes(self, past_key_values) -> None:
         """
         Print shape information for Hugging Face KV cache.
 
-        Transformers may return cache in two formats:
+        Transformers versions differ:
 
-        1. Older legacy tuple format:
-            past_key_values[layer_idx] = (key_tensor, value_tensor)
+        Older versions:
+            past_key_values is a tuple/list:
+                past_key_values[layer_idx] = (key_tensor, value_tensor)
 
-        2. Newer DynamicCache format:
-            past_key_values.key_cache[layer_idx]
-            past_key_values.value_cache[layer_idx]
+        Newer versions:
+            past_key_values is often a DynamicCache object.
 
-        This function supports both.
+        This debug function should never crash the runtime.
         """
 
         print("\nKV Cache:")
         print("cache object type:", type(past_key_values))
 
-        # New Transformers cache format: DynamicCache
-        if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
-            key_cache = past_key_values.key_cache
-            value_cache = past_key_values.value_cache
-
+        # ------------------------------------------------------------
+        # Newer Hugging Face DynamicCache-style object
+        # ------------------------------------------------------------
+        if past_key_values.__class__.__name__ == "DynamicCache":
             print("cache format: DynamicCache")
-            print("number of layers cached:", len(key_cache))
-
-            first_key = key_cache[0]
-            first_value = value_cache[0]
-
-            print("first layer key shape:  ", tuple(first_key.shape))
-            print("first layer value shape:", tuple(first_value.shape))
 
             if hasattr(past_key_values, "get_seq_length"):
-                print("cached sequence length:", past_key_values.get_seq_length())
+                try:
+                    print("cached sequence length:", past_key_values.get_seq_length())
+                except Exception as exc:
+                    print("could not read sequence length:", exc)
+
+            # Some versions expose key_cache/value_cache.
+            if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
+                key_cache = past_key_values.key_cache
+                value_cache = past_key_values.value_cache
+
+                print("number of layers cached:", len(key_cache))
+
+                if len(key_cache) > 0:
+                    print("first layer key shape:  ", tuple(key_cache[0].shape))
+                    print("first layer value shape:", tuple(value_cache[0].shape))
+
+                return
+
+            # Other versions hide the internal tensors differently.
+            # So we print available public methods/fields for debugging.
+            public_attrs = [
+                name for name in dir(past_key_values)
+                if not name.startswith("_")
+            ]
+
+            print("DynamicCache does not expose key_cache/value_cache directly.")
+            print("Available public attributes/methods:")
+            print(public_attrs)
 
             return
 
+        # ------------------------------------------------------------
+        # Legacy tuple/list cache
+        # ------------------------------------------------------------
+        if isinstance(past_key_values, (tuple, list)):
+            print("cache format: legacy tuple/list")
+            print("number of layers cached:", len(past_key_values))
+
+            first_layer = past_key_values[0]
+            key_tensor = first_layer[0]
+            value_tensor = first_layer[1]
+
+            print("first layer key shape:  ", tuple(key_tensor.shape))
+            print("first layer value shape:", tuple(value_tensor.shape))
+            return
+
+        # ------------------------------------------------------------
+        # Unknown cache type
+        # ------------------------------------------------------------
+        print("Unknown cache format.")
+        print("Available public attributes/methods:")
+        public_attrs = [
+            name for name in dir(past_key_values)
+            if not name.startswith("_")
+        ]
+        print(public_attrs)
+
+    # ------------------------------------------------------------------
+    # Benchmark helper retained from Milestone 3
+    # ------------------------------------------------------------------
+
     def compare_kv_cache_speed(
-        self, 
-        prompt: str, 
-        max_new_tokens: int=50,
-    ) -> None: 
+        self,
+        prompt: str,
+        max_new_tokens: int = 50,
+    ) -> None:
         """
-            compare generation time: 
-                - without KV cache. 
-                - with KV cache. 
-            On CPU with small models, speedup may be modest. With larger models, KV cache 
-            matters a lot more. 
+        Compare full-prefix recomputation vs step-wise KV-cache generation.
+
+        This is kept for educational benchmarking.
         """
-        print("\nBenchmarking without KV cache...")
+
+        print("\nBenchmarking old-style full generation through step API...")
         start = time.perf_counter()
-        text_no_cache = self.generate_one_without_kv_cache(
-            prompt = prompt, 
-            max_new_tokens = max_new_tokens, 
+        text = self.generate_one(
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
         )
-        no_cache_time = time.perf_counter() - start
-        print("Done.")
+        elapsed = time.perf_counter() - start
 
-        print("\nBenchmarking with KV cache...")
-        start = time.perf_counter()
-        text_cache = self.generate_one_with_kv_cache(
-            prompt = prompt, 
-            max_new_tokens = max_new_tokens,
-        )
-        cache_time = time.perf_counter() - start
-
-        print("Done. ")
-        print("\n=== Benchmark Results ===")
-        print(f"Without KV cache: {no_cache_time:.4f} seconds")
-        print(f"With KV cache: {cache_time:.4f} seconds")
-
-        if cache_time > 0: 
-            print(f"speedup: {no_cache_time / cache_time:.2f}x")
-
-        print("\n=== Output without KV cache ===")
-        print(text_no_cache)
-
-        print("\n=== Output with KV cache ===")
-        print(text_cache)
+        print(f"Elapsed: {elapsed:.4f}s")
+        print(text)
