@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from mini_vllm.runtime.sampling import sample_next_token
 import time
 
 import torch
@@ -127,8 +127,9 @@ class HFBackend(Backend):
                 logits = outputs.logits
                 next_token_logits = logits[:, -1, :]
 
-                next_token_id = self._select_next_token_greedy(
-                    next_token_logits
+                next_token_id = self._select_next_token(
+                    next_token_logits=next_token_logits,
+                    request=request,
                 )
 
             request.has_prefilled = True
@@ -184,8 +185,9 @@ class HFBackend(Backend):
                 logits = outputs.logits
                 next_token_logits = logits[:, -1, :]
 
-                next_token_id = self._select_next_token_greedy(
-                    next_token_logits
+                next_token_id = self._select_next_token(
+                    next_token_logits=next_token_logits,
+                    request=request,
                 )
 
             self._append_or_finish(
@@ -195,11 +197,189 @@ class HFBackend(Backend):
 
         except Exception as exc:
             request.mark_failed(exc)
+        # ------------------------------------------------------------------
+    # Milestone 7: simplified batched recompute API
+    # ------------------------------------------------------------------
 
+    def prepare_for_batch_recompute(self, request: GenerationRequest) -> None:
+        """
+        Prepare one request for simplified continuous batching.
+
+        This batching path does NOT use KV cache.
+
+        Instead, every request stores its current full token sequence:
+
+            request.generated_ids
+
+        Each batch step pads all active requests into one tensor and runs
+        the model on the full current sequence.
+
+        This is less efficient than KV-cache decoding, but it teaches:
+            - batch construction
+            - variable-length padding
+            - attention masks
+            - dynamic active request sets
+        """
+
+        if request.is_finished():
+            return
+
+        request.mark_running()
+
+        try:
+            encoded = self.tokenizer(
+                request.prompt,
+                return_tensors="pt",
+            )
+
+            input_ids = encoded["input_ids"].to(self.device)
+
+            request.input_ids = input_ids
+            request.generated_ids = input_ids
+            request.last_token_id = None
+            request.past_key_values = None
+            request.has_prefilled = True
+            request.num_generated_tokens = 0
+
+            if request.max_new_tokens <= 0:
+                self._finish_request(request)
+
+        except Exception as exc:
+            request.mark_failed(exc)
+
+    def decode_batch_recompute(self, requests: list[GenerationRequest]) -> None:
+        """
+        Decode one token for multiple active requests using one batched
+        forward pass.
+
+        Important:
+            This is true batching, but not KV-cache batching.
+
+        For each request, we already have:
+
+            request.generated_ids
+
+        These sequences may have different lengths.
+
+        Example:
+
+            A: [10, 20, 30]
+            B: [50, 60]
+            C: [90, 91, 92, 93]
+
+        We pad them:
+
+            A: [10, 20, 30, PAD]
+            B: [50, 60, PAD, PAD]
+            C: [90, 91, 92, 93]
+
+        And create attention mask:
+
+            A: [1, 1, 1, 0]
+            B: [1, 1, 0, 0]
+            C: [1, 1, 1, 1]
+
+        Then one model forward gives logits for the whole batch.
+
+        For each request, we take logits from its last real token position.
+        """
+
+        active_requests = [
+            request for request in requests
+            if not request.is_finished()
+        ]
+
+        if not active_requests:
+            return
+
+        # Make sure every request has tokenized state.
+        for request in active_requests:
+            if request.generated_ids is None:
+                self.prepare_for_batch_recompute(request)
+
+        # Some requests may have failed during preparation.
+        active_requests = [
+            request for request in active_requests
+            if not request.is_finished()
+        ]
+
+        if not active_requests:
+            return
+
+        pad_token_id = self.tokenizer.pad_token_id
+
+        # Each request.generated_ids has shape [1, seq_len].
+        sequence_lengths = [
+            request.generated_ids.shape[1]
+            for request in active_requests
+        ]
+
+        max_seq_len = max(sequence_lengths)
+        batch_size = len(active_requests)
+
+        batch_input_ids = torch.full(
+            size=(batch_size, max_seq_len),
+            fill_value=pad_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        attention_mask = torch.zeros(
+            size=(batch_size, max_seq_len),
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        # Copy each request's current sequence into the batch tensor.
+        for row_idx, request in enumerate(active_requests):
+            seq = request.generated_ids[0]
+            seq_len = seq.shape[0]
+
+            batch_input_ids[row_idx, :seq_len] = seq
+            attention_mask[row_idx, :seq_len] = 1
+
+        try:
+            with torch.no_grad():
+                outputs = self.model(
+                    input_ids=batch_input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                )
+
+                logits = outputs.logits
+
+                # logits shape:
+                # [batch_size, max_seq_len, vocab_size]
+                #
+                # For each row, the next-token prediction is at
+                # that request's last real token position.
+                for row_idx, request in enumerate(active_requests):
+                    seq_len = sequence_lengths[row_idx]
+                    last_real_position = seq_len - 1
+
+                    next_token_logits = logits[
+                        row_idx: row_idx + 1,
+                        last_real_position,
+                        :,
+                    ]
+
+                    next_token_id = self._select_next_token(
+                        next_token_logits=next_token_logits,
+                        request=request,
+                    )
+
+                    self._append_or_finish(
+                        request=request,
+                        next_token_id=next_token_id,
+                    )
+
+        except Exception as exc:
+            for request in active_requests:
+                request.mark_failed(exc)
     # ------------------------------------------------------------------
     # Token selection
     # ------------------------------------------------------------------
-
+    
     def _select_next_token_greedy(self, next_token_logits: torch.Tensor) -> torch.Tensor:
         """
         Greedy decoding.
@@ -219,7 +399,22 @@ class HFBackend(Backend):
             dim=-1,
             keepdim=True,
         )
+    def _select_next_token( self, next_token_logits: torch.Tensor, request: GenerationRequest,
+    ) -> torch.Tensor:
+        """
+        Select next token using the request's sampling configuration.
 
+        next_token_logits shape:
+            [batch_size, vocab_size]
+
+        Returns:
+            next_token_id shape [batch_size, 1]
+        """
+
+        return sample_next_token(
+            logits=next_token_logits,
+            config=request.sampling_config,
+        )
     # ------------------------------------------------------------------
     # Request update helpers
     # ------------------------------------------------------------------

@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from mini_vllm.runtime.sampling import SamplingConfig
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -69,7 +69,7 @@ class GenerationRequest:
     created_at: float = field(default_factory=time.perf_counter)
     started_at: float | None = None
     finished_at: float | None = None
-
+    sampling_config: SamplingConfig = field(default_factory=SamplingConfig)
     # -------------------------------
     # Milestone 5 generation state
     # -------------------------------

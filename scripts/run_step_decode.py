@@ -1,5 +1,6 @@
 from mini_vllm.backends.hf_backend import HFBackend
 from mini_vllm.runtime.request import GenerationRequest
+from mini_vllm.runtime.sampling import SamplingConfig, SamplingStrategy
 from mini_vllm.runtime.step_runtime import StepRuntime
 
 
@@ -10,12 +11,18 @@ def main():
 
     request = GenerationRequest(
         prompt="A model serving runtime is responsible for",
-        max_new_tokens=20,
+        max_new_tokens=30,
+        sampling_config=SamplingConfig(
+            strategy=SamplingStrategy.TOP_K,
+            temperature=0.8,
+            top_k=50,
+            seed=42,
+        ),
     )
 
     completed_request = runtime.run_request(
         request=request,
-        debug=True,
+        debug=False,
     )
 
     print("\n================ Final Result ================")
