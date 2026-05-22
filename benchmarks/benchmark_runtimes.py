@@ -4,7 +4,6 @@ import argparse
 import statistics
 import time
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
 
@@ -51,8 +50,6 @@ class BenchmarkResult:
 def make_prompts() -> list[str]:
     """
     Fixed prompt set for repeatable benchmarking.
-
-    These prompts are intentionally short so CPU benchmarks do not take too long.
     """
 
     return [
@@ -75,14 +72,12 @@ def make_requests(
     Important:
         Do NOT reuse request objects across benchmark runs.
 
-    Why?
-        A GenerationRequest stores state:
-            - generated_ids
-            - past_key_values
-            - status
-            - timestamps
-
-        Reusing them would corrupt the benchmark.
+    A GenerationRequest stores mutable state:
+        - generated_ids
+        - past_key_values
+        - status
+        - timestamps
+        - generated token count
     """
 
     return [
@@ -100,19 +95,36 @@ def make_requests(
 # ---------------------------------------------------------------------
 
 
+def sync_if_cuda(device: str | None) -> None:
+    """
+    CUDA operations can be asynchronous.
+
+    If timing GPU code, synchronize before/after timing regions so measured
+    wall-clock time includes actual GPU execution.
+    """
+
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def print_cuda_memory(device: str | None, label: str) -> None:
+    """
+    Print CUDA memory usage if running on GPU.
+    """
+
+    if device == "cuda" and torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024**2)
+        reserved = torch.cuda.memory_reserved() / (1024**2)
+
+        print(f"\n================ CUDA Memory: {label} ================")
+        print(f"Allocated: {allocated:.2f} MiB")
+        print(f"Reserved:  {reserved:.2f} MiB")
+        print("======================================================\n")
+
+
 def percentile(values: list[float], p: float) -> float:
     """
-    Compute percentile using simple nearest-rank style interpolation.
-
-    Args:
-        values:
-            List of numeric values.
-
-        p:
-            Percentile from 0 to 100.
-
-    Returns:
-        Percentile value.
+    Compute percentile using simple linear interpolation.
     """
 
     if not values:
@@ -140,7 +152,7 @@ def collect_common_metrics(
     batch_steps: int | None = None,
 ) -> BenchmarkResult:
     """
-    Convert completed request objects into benchmark metrics.
+    Convert processed request objects into benchmark metrics.
     """
 
     completed = [
@@ -173,10 +185,11 @@ def collect_common_metrics(
         for request in completed
     )
 
-    if total_time_seconds > 0:
-        tokens_per_second = total_generated_tokens / total_time_seconds
-    else:
-        tokens_per_second = 0.0
+    tokens_per_second = (
+        total_generated_tokens / total_time_seconds
+        if total_time_seconds > 0
+        else 0.0
+    )
 
     return BenchmarkResult(
         name=name,
@@ -210,9 +223,9 @@ def benchmark_naive_runtime(
     Benchmark NaiveRuntime.
 
     Execution pattern:
-        A fully
-        B fully
-        C fully
+        request A fully
+        then request B fully
+        then request C fully
     """
 
     requests = make_requests(
@@ -223,8 +236,12 @@ def benchmark_naive_runtime(
     runtime = NaiveRuntime(backend=backend)
     runtime.submit_many(requests)
 
+    sync_if_cuda(backend.device)
     start = time.perf_counter()
+
     runtime.run_until_empty()
+
+    sync_if_cuda(backend.device)
     total_time = time.perf_counter() - start
 
     return collect_common_metrics(
@@ -260,8 +277,12 @@ def benchmark_round_robin(
     scheduler = RoundRobinScheduler(backend=backend)
     scheduler.submit_many(requests)
 
+    sync_if_cuda(backend.device)
     start = time.perf_counter()
+
     scheduler.run_until_done(debug=False)
+
+    sync_if_cuda(backend.device)
     total_time = time.perf_counter() - start
 
     return collect_common_metrics(
@@ -302,14 +323,19 @@ def benchmark_continuous_batch(
 
     scheduler.submit_many(requests)
 
+    sync_if_cuda(backend.device)
     start = time.perf_counter()
+
     scheduler.run_until_done(debug=False)
+
+    sync_if_cuda(backend.device)
     total_time = time.perf_counter() - start
 
-    if scheduler.batch_sizes_seen:
-        avg_batch_size = sum(scheduler.batch_sizes_seen) / len(scheduler.batch_sizes_seen)
-    else:
-        avg_batch_size = 0.0
+    avg_batch_size = (
+        sum(scheduler.batch_sizes_seen) / len(scheduler.batch_sizes_seen)
+        if scheduler.batch_sizes_seen
+        else 0.0
+    )
 
     return collect_common_metrics(
         name=f"continuous_batch_recompute_bs{max_batch_size}",
@@ -377,7 +403,7 @@ def print_result_table(results: list[BenchmarkResult]) -> None:
     print("===================================================\n")
 
 
-def print_interpretation(results: list[BenchmarkResult]) -> None:
+def print_interpretation() -> None:
     """
     Print a short explanation of how to interpret results.
     """
@@ -398,7 +424,7 @@ Round-robin KV cache:
 Continuous batch recompute:
     Processes multiple active requests in one batched forward pass.
     Teaches batching and dynamic active sets.
-    But it recomputes full sequences every step, so it may be slower on CPU.
+    But it recomputes full sequences every step, so it may be slower than KV-cache decoding.
 
 Tokens/sec:
     Higher is better.
@@ -511,18 +537,21 @@ def main() -> None:
         device=args.device,
     )
 
+    print_cuda_memory(backend.device, label="after model load")
+
     # Warm-up.
     # This avoids measuring one-time overhead too heavily.
     print("\nRunning warm-up...")
-    warmup_request = GenerationRequest(
+
+    sync_if_cuda(backend.device)
+
+    backend.generate_one(
         prompt="Warm up the model by generating",
         max_new_tokens=4,
-        sampling_config=sampling_config,
     )
-    backend.generate_one(
-        prompt=warmup_request.prompt,
-        max_new_tokens=warmup_request.max_new_tokens,
-    )
+
+    sync_if_cuda(backend.device)
+
     print("Warm-up done.")
 
     results: list[BenchmarkResult] = []
@@ -552,8 +581,10 @@ def main() -> None:
         )
     )
 
+    print_cuda_memory(backend.device, label="after benchmarks")
+
     print_result_table(results)
-    print_interpretation(results)
+    print_interpretation()
 
 
 if __name__ == "__main__":

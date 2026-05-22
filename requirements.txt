@@ -1,0 +1,8 @@
+torch
+transformers
+fastapi
+uvicorn[standard]
+pydantic
+requests
+matplotlib
+pandas
