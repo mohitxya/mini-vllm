@@ -431,7 +431,14 @@ class HFBackend(Backend):
             1. EOS token generated
             2. max_new_tokens reached
             3. too many repeated whitespace tokens
+
+        Milestone 11:
+            Also records the latest generated token text so the API
+            can stream it to the client.
         """
+
+        # Clear previous token text before processing this step.
+        request.last_token_text = None
 
         if next_token_id.item() == self.tokenizer.eos_token_id:
             self._finish_request(request)
@@ -458,6 +465,9 @@ class HFBackend(Backend):
         )
 
         request.last_token_id = next_token_id
+        request.last_token_text = token_text
+        request.generated_continuation += token_text
+
         request.num_generated_tokens += 1
 
         if request.num_generated_tokens >= request.max_new_tokens:

@@ -93,6 +93,22 @@ class NaiveRuntime:
     def _process_one_request(self, request: GenerationRequest) -> None:
         """
         Process exactly one request from start to finish.
+
+        This is still naive sequential serving:
+
+            finish request A fully
+            then request B fully
+            then request C fully
+
+        But instead of calling backend.generate_one(), we use the step API:
+
+            prefill(request)
+            decode_one(request)
+            decode_one(request)
+            ...
+
+        This keeps token counts, KV cache state, timestamps, and generated_ids
+        inside the actual request object being benchmarked.
         """
 
         print(
@@ -100,21 +116,28 @@ class NaiveRuntime:
             f"max_new_tokens={request.max_new_tokens}"
         )
 
-        request.mark_running()
-
         try:
-            generated_text = self.backend.generate_one(
-                prompt=request.prompt,
-                max_new_tokens=request.max_new_tokens,
-            )
+            self.backend.prefill(request)
 
-            request.mark_finished(generated_text)
-            self.completed_requests.append(request)
+            while not request.is_finished():
+                self.backend.decode_one(request)
 
-            print(
-                f"[FINISHED] request={request.short_id()} "
-                f"runtime={request.runtime_seconds:.4f}s"
-            )
+            if request.status == RequestStatus.FINISHED:
+                self.completed_requests.append(request)
+
+                print(
+                    f"[FINISHED] request={request.short_id()} "
+                    f"tokens={request.num_generated_tokens} "
+                    f"runtime={request.runtime_seconds:.4f}s"
+                )
+
+            else:
+                self.failed_requests.append(request)
+
+                print(
+                    f"[FAILED] request={request.short_id()} "
+                    f"error={request.error}"
+                )
 
         except Exception as exc:
             request.mark_failed(exc)

@@ -94,6 +94,13 @@ class GenerationRequest:
     # Whether prefill has been run.
     has_prefilled: bool = False
 
+    # Latest generated token text.
+    # Used by streaming endpoint.
+    last_token_text: str | None = None
+
+    # Accumulated generated continuation only.
+    # This does not include the prompt.
+    generated_continuation: str = ""
     def mark_running(self) -> None:
         self.status = RequestStatus.RUNNING
 
