@@ -1,4 +1,27 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE/editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Hugging Face / model cache
+.cache/
+models/
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
