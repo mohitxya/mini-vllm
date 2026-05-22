@@ -5,7 +5,7 @@ from typing import Deque, List
 
 from mini_vllm.backends.base import Backend
 from mini_vllm.runtime.request import GenerationRequest, RequestStatus
-
+from mini_vllm.cache.paged_allocator import PagedKVCacheAllocator
 
 class RoundRobinScheduler:
     """
@@ -35,7 +35,7 @@ class RoundRobinScheduler:
     But requests are now interleaved fairly.
     """
 
-    def __init__(self, backend: Backend) -> None:
+    def __init__(self, backend: Backend, cache_allocator: PagedKVCacheAllocator | None = None,) -> None:
         self.backend = backend
 
         # Requests waiting to be prefilled.
@@ -54,6 +54,7 @@ class RoundRobinScheduler:
         self.total_decode_steps: int = 0
         self.total_prefill_steps: int = 0
 
+        self.cache_allocator = cache_allocator
     def submit(self, request: GenerationRequest) -> str:
         """
         Add one request to the waiting queue.
@@ -99,7 +100,35 @@ class RoundRobinScheduler:
         print(f"Decode steps:  {self.total_decode_steps}")
 
         return self.completed
+    def _track_cache_token(self, request: GenerationRequest) -> None:
+        """
+        Simulate storing one generated token in paged KV cache.
 
+        This does not affect actual Hugging Face KV cache.
+        It only tracks metadata for learning/observability.
+        """
+
+        if self.cache_allocator is None:
+            return
+
+        before_pages = self.cache_allocator.get_request_page_ids(
+            request.request_id
+        )
+
+        self.cache_allocator.append_token(request.request_id)
+
+        after_pages = self.cache_allocator.get_request_page_ids(
+            request.request_id
+        )
+
+        request.cache_page_ids = after_pages
+
+        if len(after_pages) > len(before_pages):
+            new_page = after_pages[-1]
+            print(
+                f"[CACHE ALLOC] request={request.short_id()} "
+                f"allocated_page={new_page}"
+            )
     def _prefill_all_waiting(self, debug: bool = False) -> None:
         """
         Prefill all waiting requests once.
@@ -116,9 +145,17 @@ class RoundRobinScheduler:
 
             print(f"[PREFILL] request={request.short_id()}")
 
+            tokens_before = request.num_generated_tokens
+
             self.backend.prefill(request)
             self.total_prefill_steps += 1
 
+            tokens_after = request.num_generated_tokens
+
+            if tokens_after > tokens_before:
+                self._track_cache_token(request)
+            if request.num_generated_tokens > 0:
+                self._track_cache_token(request)
             if debug and hasattr(self.backend, "print_request_state"):
                 self.backend.print_request_state(request)
 
@@ -153,13 +190,30 @@ class RoundRobinScheduler:
                 f"generated={request.num_generated_tokens}/{request.max_new_tokens}"
             )
 
+            tokens_before = request.num_generated_tokens
+
             self.backend.decode_one(request)
             self.total_decode_steps += 1
 
+            tokens_after = request.num_generated_tokens
+
+            if tokens_after > tokens_before:
+                self._track_cache_token(request)
+            if (
+                not request.is_finished()
+                or request.status == RequestStatus.FINISHED
+            ):
+                # If decode generated a token, num_generated_tokens increased.
+                # For this simple simulator, track one slot per decode call
+                # only if the request has at least one generated token.
+                self._track_cache_token(request)
             if debug and hasattr(self.backend, "print_request_state"):
                 self.backend.print_request_state(request)
 
             self._route_after_step(request)
+            if self.cache_allocator is not None and self.total_decode_steps % 5 == 0:
+                self.cache_allocator.print_stats()
+                self.cache_allocator.print_request_table()
 
     def _route_after_step(self, request: GenerationRequest) -> None:
         """
@@ -174,11 +228,23 @@ class RoundRobinScheduler:
         if request.status == RequestStatus.FINISHED:
             self.completed.append(request)
             print(f"[FINISHED] request={request.short_id()}")
+
+            if self.cache_allocator is not None:
+                self.cache_allocator.free_request(request.request_id)
+                request.cache_page_ids = []
+                print(f"[CACHE FREE] request={request.short_id()}")
+
             return
 
         if request.status == RequestStatus.FAILED:
             self.failed.append(request)
             print(f"[FAILED] request={request.short_id()} error={request.error}")
+
+            if self.cache_allocator is not None:
+                self.cache_allocator.free_request(request.request_id)
+                request.cache_page_ids = []
+                print(f"[CACHE FREE] request={request.short_id()}")
+
             return
 
         # If not finished or failed, it should continue decoding later.

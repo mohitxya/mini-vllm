@@ -101,6 +101,8 @@ class GenerationRequest:
     # Accumulated generated continuation only.
     # This does not include the prompt.
     generated_continuation: str = ""
+    # Simulated paged KV cache metadata.
+    cache_page_ids: list[int] = field(default_factory=list)
     def mark_running(self) -> None:
         self.status = RequestStatus.RUNNING
 
