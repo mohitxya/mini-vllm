@@ -1,0 +1,5 @@
+- This is a super minimal vLLM implementation I wrote to understand the intrinsics. 
+- I'll try to come up with from-scratch implementations for everything. 
+- It's inspired by [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) & Karpathy's [nano-gpt](https://github.com/karpathy/nanogpt). 
+- As a starting point I'll write optimized kernels for T4 & RTX 5050 (Blackwell series). 
+- I intend on keeping the codebase highly modular so I can plug in new components and add support in future. 
