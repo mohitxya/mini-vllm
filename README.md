@@ -1,5 +1,7 @@
 ![mini-vllm](/assets/mvllm_logo.png)
-
+<p align="center">
+  <img src="assets/mvllm_logo.png" width="600" alt="mini-vLLM">
+</p>
 - This is a super minimal vLLM implementation I wrote to understand the intrinsics. 
 - I'll try to come up with from-scratch implementations for everything. 
 - It's inspired by [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) & Karpathy's [nano-gpt](https://github.com/karpathy/nanogpt). 
