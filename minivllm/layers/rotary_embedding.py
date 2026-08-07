@@ -8,10 +8,11 @@ def apply_rotary_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
-    x1, x2 = torch.chunk(x.float(), 2, dim=-1)
-    y1 = x1 * cos - x2 * sin
-    y2 = x2 * cos + x1 * sin
-    return torch.cat((y1, y2), dim=-1).to(x.dtype)
+    # This matches Qwen's Hugging Face implementation exactly. In particular,
+    # cos/sin span the full head dimension as [freqs, freqs].
+    half = x.shape[-1] // 2
+    rotated = torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+    return (x.float() * cos + rotated.float() * sin).to(x.dtype)
 
 
 class RotaryEmbedding(nn.Module):
@@ -26,23 +27,32 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         self.head_size = head_size
         assert rotary_dim == head_size
-        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
-        t = torch.arange(max_position_embeddings, dtype=torch.float)
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos()
-        sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
-        self.register_buffer("cos_sin_cache", cache, persistent=False)
+        self.rotary_dim = rotary_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.register_buffer("cos_sin_cache", torch.empty(0), persistent=False)
+        self.rebuild_cache()
 
-    @torch.compile
+    def rebuild_cache(self) -> None:
+        """Recreate the non-parameter RoPE buffer after ``to_empty()``."""
+        inv_freq = 1.0 / (
+            self.base ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim)
+        )
+        positions = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        freqs = torch.einsum("i,j -> ij", positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cache = torch.stack((emb.cos(), emb.sin()), dim=0)
+        self.cos_sin_cache = cache.to(self.cos_sin_cache.device)
+
     def forward(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cos_sin = self.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
+        cos, sin = self.cos_sin_cache[:, positions]
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
         query = apply_rotary_emb(query, cos, sin)
         key = apply_rotary_emb(key, cos, sin)
         return query, key
