@@ -3,8 +3,9 @@ from torch import nn
 import triton
 import triton.language as tl
 
-from flash_attn import flash_attn_varien_func, flash_attn_with_kvcache
+from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from minivllm.utils.context import get_context
+# this contains per batch meta data. 
 
 
 @triton.jit
@@ -36,7 +37,7 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
-    store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
+    storeKvCacheKernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 class Attention(nn.Module): 
     def __init__(
